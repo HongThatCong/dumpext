@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2015 Piotr Stolarz
+   Copyright (c) 2015,2019 Piotr Stolarz
    dumpext: PE files fix, dump & analysis WinDbg extension
 
    Distributed under the GNU General Public License (the License)
@@ -8,6 +8,8 @@
    This software is distributed WITHOUT ANY WARRANTY; without even the
    implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
    See the License for more information.
+
+    2023-08-15  v1.0    HTC (TQN) @VCS - Fix, build with VS2022, WinSDK 10
  */
 
 #include "common.h"
@@ -380,7 +382,7 @@ static void get_owner_info(ULONG64 mod_base, const image_nt_headers_t *p_nt_hdrs
 
     char ptr_addr[32];
     if (ptrtpy==pe_ptrtpy_rva) {
-        sprintf(ptr_addr, "addr: 0x%p, ", RVA2ADDR(ptr, mod_base));
+        sprintf(ptr_addr, "addr: 0x%p, ", (void*)RVA2ADDR(ptr, mod_base));
     } else
         *ptr_addr=0;
 
@@ -969,6 +971,10 @@ static void print_seh_hndlrs(
 /* exported; see header for details */
 void print_lconf(ULONG64 mod_base, const rng_spec_t *p_rng)
 {
+#define __CHK_LEN_CNSTR(fsz) \
+    if (lconf_sz < (fsz)) break; \
+    lconf_sz-=fsz;
+
     prnt_dir_hndl_t hndl;
     if (!init_prnt_dir_hndl(
         &hndl, mod_base, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, p_rng)) goto finish;
@@ -976,11 +982,6 @@ void print_lconf(ULONG64 mod_base, const rng_spec_t *p_rng)
     /* print header */
     if (!hndl.dir_addr || (!p_rng && !hndl.dir_sz)) {
         info_dbgprintf("No load config descr. in this module!\n");
-        goto finish;
-    } else
-    if (!p_rng && hndl.dir_sz!=0x40) {
-        info_dbgprintf(
-            "Unrecognised load config descr. with size 0x04X\n", hndl.dir_sz);
         goto finish;
     } else {
        info_dbgprintf("Load config descr. at: 0x%p\n", hndl.dir_addr);
@@ -991,135 +992,187 @@ void print_lconf(ULONG64 mod_base, const rng_spec_t *p_rng)
     ULONG cb;
     ULONG64 addr, n_seh_hndlrs;
 
-    if (hndl.nt_hdrs.pe_tpy==pe_32bit)
+    /* Load Configuration Directory Entry struct size varies depending on OS
+       versions, with newer OSes supporting fields present later in the struct.
+       Therefore directory size is taken into account during parsing the entry.
+     */
+    do
     {
-        DWORD sec_cookie;
-
-        /* 32-bit load conf */
-        IMAGE_LOAD_CONFIG_DIRECTORY32 lconf;
-        if (!(read_memory(hndl.dir_addr, &lconf, sizeof(lconf), &cb) &&
-            cb==sizeof(lconf))) goto finish;
-
-        dbgprintf("Size:                    0x%08X\n",
-            get_32uint_le(&lconf.Size));
-        dbgprintf("Timestamp:               0x%08X\n",
-            get_32uint_le(&lconf.TimeDateStamp));
-        dbgprintf("Major version:           0x%04X\n",
-            get_16uint_le(&lconf.MajorVersion));
-        dbgprintf("Minor version:           0x%04X\n",
-            get_16uint_le(&lconf.MinorVersion));
-        dbgprintf("Glob. flags clear:       0x%08X\n",
-            get_32uint_le(&lconf.GlobalFlagsClear));
-        dbgprintf("Glob. flags set:         0x%08X\n",
-            get_32uint_le(&lconf.GlobalFlagsSet));
-        dbgprintf("Crit-sect. def. timeout: 0x%08X\n",
-            get_32uint_le(&lconf.CriticalSectionDefaultTimeout));
-        dbgprintf("De-comm free blck thrsh: 0x%08X\n",
-            get_32uint_le(&lconf.DeCommitFreeBlockThreshold));
-        dbgprintf("De-comm total free thrsh:0x%08X\n",
-            get_32uint_le(&lconf.DeCommitTotalFreeThreshold));
-        addr = DEBUG_EXTEND64(get_32uint_le(&lconf.LockPrefixTable));
-        dbgprintf("LOCK prefs table at:     0x%p[0x%08X]\n",
-            addr, ADDR2RVA(addr, mod_base));
-        dbgprintf("Max allocation size:     0x%08X\n",
-            get_32uint_le(&lconf.MaximumAllocationSize));
-        dbgprintf("Virtual memory threshold:0x%08X\n",
-            get_32uint_le(&lconf.VirtualMemoryThreshold));
-        dbgprintf("Process heap flags:      0x%08X\n",
-            get_32uint_le(&lconf.ProcessHeapFlags));
-        dbgprintf("Process affinity mask:   0x%08X\n",
-            get_32uint_le(&lconf.ProcessAffinityMask));
-        dbgprintf("CSD version:             0x%04X\n",
-            get_16uint_le(&lconf.CSDVersion));
-        dbgprintf("Reserved:                0x%04X\n",
-            get_16uint_le(&lconf.Reserved1));
-        addr = DEBUG_EXTEND64(get_32uint_le(&lconf.EditList));
-        dbgprintf("Edit list at:            0x%p[0x%08X]\n",
-            addr, ADDR2RVA(addr, mod_base));
-
-        addr = DEBUG_EXTEND64(get_32uint_le(&lconf.SecurityCookie));
-        dbgprintf("Security cookie at:      0x%p[0x%08X]",
-            addr, ADDR2RVA(addr, mod_base));
-        if (addr && read_memory(addr, &sec_cookie, sizeof(sec_cookie), &cb) &&
-            cb==sizeof(sec_cookie))
+        if (hndl.nt_hdrs.pe_tpy==pe_32bit)
         {
-            dbgprintf(" -> 0x%08X\n", get_32uint_le(&sec_cookie));
+            /* 32-bit load conf */
+            DWORD sec_cookie;
+            IMAGE_LOAD_CONFIG_DIRECTORY32 lconf;
+            size_t lconf_sz =
+                (!p_rng ? min(hndl.dir_sz, sizeof(lconf)) : sizeof(lconf));
+
+            if (!(read_memory(hndl.dir_addr, &lconf, lconf_sz, &cb) &&
+                cb==lconf_sz)) goto finish;
+
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Size:                    0x%08X\n",
+                get_32uint_le(&lconf.Size));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Timestamp:               0x%08X\n",
+                get_32uint_le(&lconf.TimeDateStamp));
+            __CHK_LEN_CNSTR(2);
+            dbgprintf("Major version:           0x%04X\n",
+                get_16uint_le(&lconf.MajorVersion));
+            __CHK_LEN_CNSTR(2);
+            dbgprintf("Minor version:           0x%04X\n",
+                get_16uint_le(&lconf.MinorVersion));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Glob. flags clear:       0x%08X\n",
+                get_32uint_le(&lconf.GlobalFlagsClear));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Glob. flags set:         0x%08X\n",
+                get_32uint_le(&lconf.GlobalFlagsSet));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Crit-sect. def. timeout: 0x%08X\n",
+                get_32uint_le(&lconf.CriticalSectionDefaultTimeout));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("De-comm free blck thrsh: 0x%08X\n",
+                get_32uint_le(&lconf.DeCommitFreeBlockThreshold));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("De-comm total free thrsh:0x%08X\n",
+                get_32uint_le(&lconf.DeCommitTotalFreeThreshold));
+            __CHK_LEN_CNSTR(4);
+            addr = DEBUG_EXTEND64(get_32uint_le(&lconf.LockPrefixTable));
+            dbgprintf("LOCK prefs table at:     0x%p[0x%08X]\n",
+                addr, ADDR2RVA(addr, mod_base));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Max allocation size:     0x%08X\n",
+                get_32uint_le(&lconf.MaximumAllocationSize));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Virtual memory threshold:0x%08X\n",
+                get_32uint_le(&lconf.VirtualMemoryThreshold));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Process heap flags:      0x%08X\n",
+                get_32uint_le(&lconf.ProcessHeapFlags));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Process affinity mask:   0x%08X\n",
+                get_32uint_le(&lconf.ProcessAffinityMask));
+            __CHK_LEN_CNSTR(2);
+            dbgprintf("CSD version:             0x%04X\n",
+                get_16uint_le(&lconf.CSDVersion));
+            __CHK_LEN_CNSTR(2);
+            dbgprintf("DependentLoadFlags:      0x%04X\n",
+                get_16uint_le(&lconf.DependentLoadFlags));
+            __CHK_LEN_CNSTR(4);
+            addr = DEBUG_EXTEND64(get_32uint_le(&lconf.EditList));
+            dbgprintf("Edit list at:            0x%p[0x%08X]\n",
+                addr, ADDR2RVA(addr, mod_base));
+
+            __CHK_LEN_CNSTR(4);
+            addr = DEBUG_EXTEND64(get_32uint_le(&lconf.SecurityCookie));
+            dbgprintf("Security cookie at:      0x%p[0x%08X]",
+                addr, ADDR2RVA(addr, mod_base));
+            if (addr && read_memory(addr, &sec_cookie, sizeof(sec_cookie), &cb)
+                && cb==sizeof(sec_cookie))
+            {
+                dbgprintf(" -> 0x%08X\n", get_32uint_le(&sec_cookie));
+            } else
+                dbgprintf("\n");
+
+            __CHK_LEN_CNSTR(4);
+            addr = DEBUG_EXTEND64(get_32uint_le(&lconf.SEHandlerTable));
+            dbgprintf("SEH handlers table at:   0x%p[0x%08X]\n",
+                addr, ADDR2RVA(addr, mod_base));
+            __CHK_LEN_CNSTR(4);
+            n_seh_hndlrs = (ULONG64)get_32uint_le(&lconf.SEHandlerCount);
+            dbgprintf("SEH handlers count:      0x%08X\n", (UINT)n_seh_hndlrs);
+            print_seh_hndlrs(addr, n_seh_hndlrs, mod_base);
         } else
-            dbgprintf("\n");
-
-        addr = DEBUG_EXTEND64(get_32uint_le(&lconf.SEHandlerTable));
-        dbgprintf("SEH handlers table at:   0x%p[0x%08X]\n",
-            addr, ADDR2RVA(addr, mod_base));
-        n_seh_hndlrs = (ULONG64)get_32uint_le(&lconf.SEHandlerCount);
-        dbgprintf("SEH handlers count:      0x%08X\n", (UINT)n_seh_hndlrs);
-        print_seh_hndlrs(addr, n_seh_hndlrs, mod_base);
-    } else
-    {
-        ULONG64 sec_cookie;
-
-        /* 64-bit load conf */
-        IMAGE_LOAD_CONFIG_DIRECTORY64 lconf;
-        if (!(read_memory(hndl.dir_addr, &lconf, sizeof(lconf), &cb) &&
-            cb==sizeof(lconf))) goto finish;
-
-        dbgprintf("Size:                    0x%08X\n",
-            get_32uint_le(&lconf.Size));
-        dbgprintf("Timestamp:               0x%08X\n",
-            get_32uint_le(&lconf.TimeDateStamp));
-        dbgprintf("Major version:           0x%04X\n",
-            get_16uint_le(&lconf.MajorVersion));
-        dbgprintf("Minor version:           0x%04X\n",
-            get_16uint_le(&lconf.MinorVersion));
-        dbgprintf("Glob. flags clear:       0x%08X\n",
-            get_32uint_le(&lconf.GlobalFlagsClear));
-        dbgprintf("Glob. flags set:         0x%08X\n",
-            get_32uint_le(&lconf.GlobalFlagsSet));
-        dbgprintf("Crit-sect. def. timeout: 0x%08X\n",
-            get_32uint_le(&lconf.CriticalSectionDefaultTimeout));
-        dbgprintf("De-comm free blck thrsh: 0x%016I64X\n",
-            get_64uint_le(&lconf.DeCommitFreeBlockThreshold));
-        dbgprintf("De-comm total free thrsh:0x%016I64X\n",
-            get_64uint_le(&lconf.DeCommitTotalFreeThreshold));
-        addr = get_64uint_le(&lconf.LockPrefixTable);
-        dbgprintf("LOCK prefs table at:     0x%p[0x%08X]\n",
-            addr, ADDR2RVA(addr, mod_base));
-        dbgprintf("Max allocation size:     0x%016I64X\n",
-            get_64uint_le(&lconf.MaximumAllocationSize));
-        dbgprintf("Virtual memory threshold:0x%016I64X\n",
-            get_64uint_le(&lconf.VirtualMemoryThreshold));
-        dbgprintf("Process affinity mask:   0x%016I64X\n",
-            get_64uint_le(&lconf.ProcessAffinityMask));
-        dbgprintf("Process heap flags:      0x%08X\n",
-            get_32uint_le(&lconf.ProcessHeapFlags));
-        dbgprintf("CSD version:             0x%04X\n",
-            get_16uint_le(&lconf.CSDVersion));
-        dbgprintf("Reserved:                0x%04X\n",
-            get_16uint_le(&lconf.Reserved1));
-        addr = get_64uint_le(&lconf.EditList);
-        dbgprintf("Edit list at:            0x%p[0x%08X]\n",
-            addr, ADDR2RVA(addr, mod_base));
-
-        addr = get_64uint_le(&lconf.SecurityCookie);
-        dbgprintf("Security cookie at:      0x%p[0x%08X]",
-            addr, ADDR2RVA(addr, mod_base));
-        if (addr && read_memory(addr, &sec_cookie, sizeof(sec_cookie), &cb) &&
-            cb==sizeof(sec_cookie))
         {
-            dbgprintf(" -> 0x%016I64X\n", get_64uint_le(&sec_cookie));
-        } else
-            dbgprintf("\n");
+            /* 64-bit load conf */
+            ULONG64 sec_cookie;
+            IMAGE_LOAD_CONFIG_DIRECTORY64 lconf;
+            size_t lconf_sz =
+                (!p_rng ? min(hndl.dir_sz, sizeof(lconf)) : sizeof(lconf));
 
-        addr = get_64uint_le(&lconf.SEHandlerTable);
-        dbgprintf("SEH handlers table at:   0x%p[0x%08X]\n",
-            addr, ADDR2RVA(addr, mod_base));
-        n_seh_hndlrs = get_64uint_le(&lconf.SEHandlerCount);
-        dbgprintf("SEH handlers count:      0x%016I64X\n",
-            get_64uint_le(&lconf.SEHandlerCount));
-        print_seh_hndlrs(addr, n_seh_hndlrs, mod_base);
-    }
+            if (!(read_memory(hndl.dir_addr, &lconf, lconf_sz, &cb) &&
+                cb==lconf_sz)) goto finish;
+
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Size:                    0x%08X\n",
+                get_32uint_le(&lconf.Size));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Timestamp:               0x%08X\n",
+                get_32uint_le(&lconf.TimeDateStamp));
+            __CHK_LEN_CNSTR(2);
+            dbgprintf("Major version:           0x%04X\n",
+                get_16uint_le(&lconf.MajorVersion));
+            __CHK_LEN_CNSTR(2);
+            dbgprintf("Minor version:           0x%04X\n",
+                get_16uint_le(&lconf.MinorVersion));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Glob. flags clear:       0x%08X\n",
+                get_32uint_le(&lconf.GlobalFlagsClear));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Glob. flags set:         0x%08X\n",
+                get_32uint_le(&lconf.GlobalFlagsSet));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Crit-sect. def. timeout: 0x%08X\n",
+                get_32uint_le(&lconf.CriticalSectionDefaultTimeout));
+            __CHK_LEN_CNSTR(8);
+            dbgprintf("De-comm free blck thrsh: 0x%016I64X\n",
+                get_64uint_le(&lconf.DeCommitFreeBlockThreshold));
+            __CHK_LEN_CNSTR(8);
+            dbgprintf("De-comm total free thrsh:0x%016I64X\n",
+                get_64uint_le(&lconf.DeCommitTotalFreeThreshold));
+            __CHK_LEN_CNSTR(8);
+            addr = get_64uint_le(&lconf.LockPrefixTable);
+            dbgprintf("LOCK prefs table at:     0x%p[0x%08X]\n",
+                addr, ADDR2RVA(addr, mod_base));
+            __CHK_LEN_CNSTR(8);
+            dbgprintf("Max allocation size:     0x%016I64X\n",
+                get_64uint_le(&lconf.MaximumAllocationSize));
+            __CHK_LEN_CNSTR(8);
+            dbgprintf("Virtual memory threshold:0x%016I64X\n",
+                get_64uint_le(&lconf.VirtualMemoryThreshold));
+            __CHK_LEN_CNSTR(8);
+            dbgprintf("Process affinity mask:   0x%016I64X\n",
+                get_64uint_le(&lconf.ProcessAffinityMask));
+            __CHK_LEN_CNSTR(4);
+            dbgprintf("Process heap flags:      0x%08X\n",
+                get_32uint_le(&lconf.ProcessHeapFlags));
+            __CHK_LEN_CNSTR(2);
+            dbgprintf("CSD version:             0x%04X\n",
+                get_16uint_le(&lconf.CSDVersion));
+            __CHK_LEN_CNSTR(2);
+            dbgprintf("DependentLoadFlags:      0x%04X\n",
+                get_16uint_le(&lconf.DependentLoadFlags));
+            __CHK_LEN_CNSTR(8);
+            addr = get_64uint_le(&lconf.EditList);
+            dbgprintf("Edit list at:            0x%p[0x%08X]\n",
+                addr, ADDR2RVA(addr, mod_base));
+
+            __CHK_LEN_CNSTR(8);
+            addr = get_64uint_le(&lconf.SecurityCookie);
+            dbgprintf("Security cookie at:      0x%p[0x%08X]",
+                addr, ADDR2RVA(addr, mod_base));
+            if (addr && read_memory(addr, &sec_cookie, sizeof(sec_cookie), &cb)
+                && cb==sizeof(sec_cookie))
+            {
+                dbgprintf(" -> 0x%016I64X\n", get_64uint_le(&sec_cookie));
+            } else
+                dbgprintf("\n");
+
+            __CHK_LEN_CNSTR(8);
+            addr = get_64uint_le(&lconf.SEHandlerTable);
+            dbgprintf("SEH handlers table at:   0x%p[0x%08X]\n",
+                addr, ADDR2RVA(addr, mod_base));
+            __CHK_LEN_CNSTR(8);
+            n_seh_hndlrs = get_64uint_le(&lconf.SEHandlerCount);
+            dbgprintf("SEH handlers count:      0x%016I64X\n", n_seh_hndlrs);
+            print_seh_hndlrs(addr, n_seh_hndlrs, mod_base);
+        }
+    } while(FALSE);
 
 finish:
     return;
+
+#undef __CHK_LEN_CNSTR
 }
 
 /* exported; see header for details */
@@ -1336,7 +1389,7 @@ void print_reloc(ULONG64 mod_base, const rng_spec_t *p_rng)
     }
     info_dbgprintf("RVA provided in []\n\n");
 
-    DWORD off=0; 
+    DWORD off=0;
     DWORD len_cnstr = (p_rng ? p_rng->rng.len : hndl.dir_sz);
     IMAGE_BASE_RELOCATION reloc_info;
 
@@ -2264,7 +2317,7 @@ static BOOL read_sects_cfg(dump_pe_hndl_t *p_hndl)
                     "Appending section %d to the sections table...\n", i+1);
                 if (i<MAX_SECTIONS)
                 {
-                    memset(&p_hndl->sectab[i], 0, sizeof(p_hndl->sectab[i])); 
+                    memset(&p_hndl->sectab[i], 0, sizeof(p_hndl->sectab[i]));
 
                     p_hndl->n_sects++;
                     set_16uint_le(
